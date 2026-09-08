@@ -1,0 +1,4 @@
+Flask
+requests[socks]
+yt-dlp
+python-dotenv
