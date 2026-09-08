@@ -1,7 +1,6 @@
 import os
 import re
 import uuid
-import shutil
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -10,41 +9,48 @@ import requests
 import yt_dlp
 
 from flask import Flask, request, jsonify, send_file
-from dotenv import load_dotenv
 
-
-# ==================================================
-# Configuration
-# ==================================================
-
-load_dotenv()
 
 app = Flask(__name__)
 
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-API_TOKEN = os.getenv("API_TOKEN", "").strip()
-SOCKS5_PROXY = os.getenv("SOCKS5_PROXY", "").strip()
 
-BASE_DIR = Path(__file__).resolve().parent
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+YOUTUBE_API_KEY = os.environ.get(
+    "YOUTUBE_API_KEY",
+    ""
+).strip()
+
+API_TOKEN = os.environ.get(
+    "API_TOKEN",
+    ""
+).strip()
+
+SOCKS5_PROXY = os.environ.get(
+    "SOCKS5_PROXY",
+    ""
+).strip()
+
+
+# Vercel filesystem is temporary.
+BASE_DIR = Path("/tmp")
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
-# Delete files older than 5 minutes
 FILE_MAX_AGE = 300
 
 
-# ==================================================
-# Proxy
-# ==================================================
+# ============================================================
+# PROXY
+# ============================================================
 
-def get_requests_proxies():
-    """
-    Configure SOCKS5 proxy for requests.
-
-    Example:
-    socks5h://127.0.0.1:1080
-    """
+def get_proxy():
 
     if not SOCKS5_PROXY:
         return None
@@ -55,86 +61,29 @@ def get_requests_proxies():
     }
 
 
-REQUESTS_PROXIES = get_requests_proxies()
+REQUESTS_PROXIES = get_proxy()
 
 
-# ==================================================
-# Authorization
-# ==================================================
+# ============================================================
+# AUTH
+# ============================================================
 
 def authorized_request():
 
     if not API_TOKEN:
         return True
 
-    supplied = request.headers.get(
+    token = request.headers.get(
         "X-API-Token",
         ""
     )
 
-    return supplied == API_TOKEN
+    return token == API_TOKEN
 
 
-# ==================================================
-# YouTube URL Validation
-# ==================================================
-
-def valid_youtube_url(url):
-
-    try:
-
-        parsed = urlparse(url)
-
-        if parsed.scheme not in (
-            "http",
-            "https"
-        ):
-            return False
-
-        host = parsed.netloc.lower().split(":")[0]
-
-        allowed_hosts = {
-            "youtube.com",
-            "www.youtube.com",
-            "m.youtube.com",
-            "youtu.be",
-            "www.youtu.be",
-        }
-
-        return host in allowed_hosts
-
-    except Exception:
-
-        return False
-
-
-# ==================================================
-# Safe Filename
-# ==================================================
-
-def safe_filename(name):
-
-    name = re.sub(
-        r'[\\/*?:"<>|]',
-        "",
-        name
-    )
-
-    name = re.sub(
-        r"\s+",
-        " ",
-        name
-    ).strip()
-
-    if not name:
-        name = "download"
-
-    return name[:120]
-
-
-# ==================================================
-# Cleanup
-# ==================================================
+# ============================================================
+# CLEANUP
+# ============================================================
 
 def cleanup_old_files():
 
@@ -154,27 +103,74 @@ def cleanup_old_files():
                         item.unlink()
 
                     elif item.is_dir():
+                        import shutil
                         shutil.rmtree(item)
 
-            except (
-                FileNotFoundError,
-                PermissionError
-            ):
-
-                pass
-
             except Exception:
-
                 pass
 
     except Exception:
-
         pass
 
 
-# ==================================================
-# Health
-# ==================================================
+# ============================================================
+# SAFE FILENAME
+# ============================================================
+
+def safe_filename(name):
+
+    name = re.sub(
+        r'[\\/*?:"<>|]',
+        "",
+        name
+    )
+
+    name = re.sub(
+        r"\s+",
+        " ",
+        name
+    ).strip()
+
+    if not name:
+        name = "download"
+
+    return name[:100]
+
+
+# ============================================================
+# YOUTUBE URL VALIDATION
+# ============================================================
+
+def valid_youtube_url(url):
+
+    try:
+
+        parsed = urlparse(url)
+
+        if parsed.scheme not in (
+            "http",
+            "https"
+        ):
+            return False
+
+        host = parsed.netloc.lower().split(":")[0]
+
+        return host in {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+            "www.youtu.be"
+        }
+
+    except Exception:
+
+        return False
+
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.route("/")
 def home():
@@ -201,9 +197,9 @@ def healthz():
     }), 200
 
 
-# ==================================================
-# YouTube Search
-# ==================================================
+# ============================================================
+# SEARCH
+# ============================================================
 
 @app.route("/search", methods=["GET"])
 def search():
@@ -292,6 +288,28 @@ def search():
             if not video_id:
                 continue
 
+            thumbnails = snippet.get(
+                "thumbnails",
+                {}
+            )
+
+            thumbnail = (
+                thumbnails.get(
+                    "high",
+                    {}
+                ).get("url")
+                or
+                thumbnails.get(
+                    "medium",
+                    {}
+                ).get("url")
+                or
+                thumbnails.get(
+                    "default",
+                    {}
+                ).get("url")
+            )
+
             results.append({
 
                 "id": video_id,
@@ -316,30 +334,11 @@ def search():
                     ""
                 ),
 
-                "thumbnail": (
-                    snippet.get(
-                        "thumbnails",
-                        {}
-                    ).get(
-                        "high",
-                        {}
-                    ).get("url")
+                "thumbnail": thumbnail,
 
-                    or
-
-                    snippet.get(
-                        "thumbnails",
-                        {}
-                    ).get(
-                        "medium",
-                        {}
-                    ).get("url")
-                ),
-
-                "url": (
+                "url":
                     "https://www.youtube.com/watch?v="
                     + video_id
-                )
             })
 
         return jsonify({
@@ -351,6 +350,7 @@ def search():
             "count": len(results),
 
             "results": results
+
         })
 
     except requests.RequestException as e:
@@ -368,9 +368,9 @@ def search():
         }), 500
 
 
-# ==================================================
-# Download
-# ==================================================
+# ============================================================
+# DOWNLOAD
+# ============================================================
 
 @app.route("/download", methods=["GET"])
 def download():
@@ -412,7 +412,6 @@ def download():
             "error": "Type must be audio or video."
         }), 400
 
-    # Clean old files whenever the function runs
     cleanup_old_files()
 
     job_id = uuid.uuid4().hex
@@ -422,82 +421,69 @@ def download():
         f"{job_id}.%(ext)s"
     )
 
+    ydl_opts = {
+
+        "outtmpl": output_template,
+
+        "noplaylist": True,
+
+        "quiet": True,
+
+        "no_warnings": True,
+
+        "restrictfilenames": True
+    }
+
+    # ========================================================
+    # SOCKS5
+    # ========================================================
+
+    if SOCKS5_PROXY:
+
+        ydl_opts["proxy"] = SOCKS5_PROXY
+
+
+    # ========================================================
+    # AUDIO
+    # ========================================================
+
+    if media_type == "audio":
+
+        ydl_opts.update({
+
+            "format": "bestaudio/best",
+
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+
+                    "preferredcodec": "mp3",
+
+                    "preferredquality": "192"
+                }
+            ]
+        })
+
+
+    # ========================================================
+    # VIDEO
+    # ========================================================
+
+    else:
+
+        ydl_opts.update({
+
+            "format": (
+                "bestvideo[height<=1080]+"
+                "bestaudio/"
+                "best[height<=1080]/best"
+            ),
+
+            "merge_output_format": "mp4"
+        })
+
+
     try:
-
-        # ==================================================
-        # yt-dlp Options
-        # ==================================================
-
-        ydl_opts = {
-
-            "outtmpl": output_template,
-
-            "noplaylist": True,
-
-            "quiet": True,
-
-            "no_warnings": True,
-
-            "restrictfilenames": True,
-
-            "js_runtimes": {
-                "deno": {}
-            }
-        }
-
-        # Add SOCKS5 proxy only when configured
-        if SOCKS5_PROXY:
-
-            ydl_opts["proxy"] = SOCKS5_PROXY
-
-
-        # ==================================================
-        # Audio
-        # ==================================================
-
-        if media_type == "audio":
-
-            ydl_opts.update({
-
-                "format": "bestaudio/best",
-
-                "postprocessors": [
-
-                    {
-                        "key": "FFmpegExtractAudio",
-
-                        "preferredcodec": "mp3",
-
-                        "preferredquality": "192"
-                    }
-
-                ]
-
-            })
-
-
-        # ==================================================
-        # Video
-        # ==================================================
-
-        else:
-
-            ydl_opts.update({
-
-                "format": (
-                    "bestvideo[height<=1080]+"
-                    "bestaudio/"
-                    "best[height<=1080]/best"
-                ),
-
-                "merge_output_format": "mp4"
-
-            })
-
-
-        # ==================================================
-        # Download
-        # ==================================================
 
         with yt_dlp.YoutubeDL(
             ydl_opts
@@ -516,47 +502,37 @@ def download():
             )
 
 
-        # ==================================================
-        # Find File
-        # ==================================================
+        # ====================================================
+        # FIND FILE
+        # ====================================================
 
-        possible_files = list(
-            DOWNLOAD_DIR.glob(
+        files = [
+            p
+            for p in DOWNLOAD_DIR.glob(
                 f"{job_id}.*"
             )
-        )
-
-        possible_files = [
-            p
-            for p in possible_files
             if p.is_file()
         ]
 
-        if not possible_files:
+        if not files:
 
             return jsonify({
-                "error": (
-                    "Download completed but output "
-                    "file was not found."
-                )
+                "error": "Downloaded file was not found."
             }), 500
 
-        file_path = possible_files[0]
+        file_path = files[0]
 
         extension = file_path.suffix.lower()
 
         final_path = DOWNLOAD_DIR / (
-            f"{title}-{job_id[:8]}{extension}"
+            f"{title}-{job_id[:8]}"
+            f"{extension}"
         )
 
         file_path.rename(
             final_path
         )
 
-
-        # ==================================================
-        # Return File
-        # ==================================================
 
         return send_file(
 
@@ -581,11 +557,11 @@ def download():
 
         return jsonify({
 
-            "error": (
-                "The video could not be downloaded."
-            ),
+            "error":
+                "The video could not be downloaded.",
 
-            "details": str(e)
+            "details":
+                str(e)
 
         }), 422
 
@@ -603,8 +579,17 @@ def download():
 
         return jsonify({
 
-            "error": "Download failed.",
+            "error":
+                "Download failed.",
 
-            "details": str(e)
+            "details":
+                str(e)
 
         }), 500
+
+
+# ============================================================
+# VERCEL ENTRYPOINT
+# ============================================================
+
+# Do NOT use app.run() on Vercel.
