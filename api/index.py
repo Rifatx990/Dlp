@@ -4,6 +4,8 @@ import time
 import uuid
 import shutil
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -26,15 +28,16 @@ app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Bundled binaries:
-# /var/task/bin/ffmpeg
-# /var/task/bin/ffprobe
+# Optional bundled binaries
 BIN_DIR = BASE_DIR / "bin"
 
 # Vercel writable directory
 TMP_DIR = Path("/tmp")
 
 DOWNLOAD_DIR = TMP_DIR / "downloads"
+
+# Automatically downloaded FFmpeg location
+FFMPEG_DIR = TMP_DIR / "ffmpeg-bin"
 
 DOWNLOAD_DIR.mkdir(
     parents=True,
@@ -66,68 +69,26 @@ SOCKS5_PROXY = os.getenv(
 # SETTINGS
 # ============================================================
 
-FILE_LIFETIME = 300  # 5 minutes
+FILE_LIFETIME = 300
 
 MAX_VIDEO_HEIGHT = 1080
 
+# Official BtbN latest Linux x86_64 GPL build
+FFMPEG_URL = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/"
+    "download/latest/"
+    "ffmpeg-master-latest-linux64-gpl.tar.xz"
+)
 
-# ============================================================
-# BINARY DETECTION
-# ============================================================
+FFMPEG_ARCHIVE = (
+    TMP_DIR /
+    "ffmpeg-linux64.tar.xz"
+)
 
-def find_binary(name):
-    """
-    Find FFmpeg/FFprobe automatically.
-
-    Search order:
-
-    1. /var/task/bin/
-    2. /tmp/
-    3. system PATH
-    """
-
-    candidates = [
-        BIN_DIR / name,
-        TMP_DIR / name
-    ]
-
-    # --------------------------------------------------------
-    # Bundled binary
-    # --------------------------------------------------------
-
-    for path in candidates:
-
-        try:
-
-            if path.exists() and path.is_file():
-
-                # Try to make executable
-                try:
-
-                    current_mode = path.stat().st_mode
-
-                    path.chmod(
-                        current_mode | 0o111
-                    )
-
-                except Exception:
-                    pass
-
-                return str(path)
-
-        except Exception:
-            continue
-
-    # --------------------------------------------------------
-    # System binary
-    # --------------------------------------------------------
-
-    system_path = shutil.which(name)
-
-    if system_path:
-        return system_path
-
-    return None
+FFMPEG_INSTALL_LOCK = (
+    TMP_DIR /
+    ".ffmpeg-install.lock"
+)
 
 
 # ============================================================
@@ -135,11 +96,6 @@ def find_binary(name):
 # ============================================================
 
 def test_binary(path):
-    """
-    Check whether a binary can actually execute.
-
-    Merely finding the file is not enough.
-    """
 
     if not path:
 
@@ -151,31 +107,23 @@ def test_binary(path):
 
     try:
 
-        # Make executable
+        p = Path(path)
+
         try:
-
-            p = Path(path)
-
             p.chmod(
                 p.stat().st_mode | 0o111
             )
-
         except Exception:
             pass
 
         result = subprocess.run(
-
             [
-                path,
+                str(p),
                 "-version"
             ],
-
             stdout=subprocess.PIPE,
-
             stderr=subprocess.PIPE,
-
             text=True,
-
             timeout=10
         )
 
@@ -188,75 +136,372 @@ def test_binary(path):
         version = None
 
         if output:
-
             version = output.splitlines()[0]
 
         return {
-
             "found": True,
-
             "executable":
                 result.returncode == 0,
-
             "return_code":
                 result.returncode,
-
             "version":
                 version
-
         }
 
     except PermissionError as e:
 
         return {
-
             "found": True,
-
             "executable": False,
-
             "error":
                 "Permission denied: " + str(e)
-
         }
 
     except OSError as e:
 
         return {
-
             "found": True,
-
             "executable": False,
-
             "error":
                 "OS execution error: " + str(e)
-
         }
 
     except subprocess.TimeoutExpired:
 
         return {
-
             "found": True,
-
             "executable": False,
-
             "error":
                 "Binary execution timed out"
-
         }
 
     except Exception as e:
 
         return {
-
             "found": True,
-
             "executable": False,
-
             "error":
                 repr(e)
-
         }
+
+
+# ============================================================
+# FIND BINARY
+# ============================================================
+
+def find_binary(name):
+
+    candidates = [
+
+        # Project bundled binary
+        BIN_DIR / name,
+
+        # Automatically installed binary
+        FFMPEG_DIR / name,
+
+        # Search recursively inside extracted directory
+        # handled below
+
+        # Direct /tmp fallback
+        TMP_DIR / name
+    ]
+
+    for path in candidates:
+
+        try:
+
+            if path.exists() and path.is_file():
+
+                try:
+                    path.chmod(
+                        path.stat().st_mode | 0o111
+                    )
+                except Exception:
+                    pass
+
+                return str(path)
+
+        except Exception:
+            continue
+
+    # --------------------------------------------------------
+    # Search inside automatically extracted directories
+    # --------------------------------------------------------
+
+    if FFMPEG_DIR.exists():
+
+        try:
+
+            for path in FFMPEG_DIR.rglob(name):
+
+                if path.is_file():
+
+                    try:
+                        path.chmod(
+                            path.stat().st_mode | 0o111
+                        )
+                    except Exception:
+                        pass
+
+                    return str(path)
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # System PATH
+    # --------------------------------------------------------
+
+    system_path = shutil.which(name)
+
+    if system_path:
+        return system_path
+
+    return None
+
+
+# ============================================================
+# DOWNLOAD FFMPEG
+# ============================================================
+
+def download_ffmpeg():
+
+    ffmpeg = find_binary("ffmpeg")
+    ffprobe = find_binary("ffprobe")
+
+    # Already available
+    if ffmpeg and ffprobe:
+
+        ffmpeg_test = test_binary(ffmpeg)
+        ffprobe_test = test_binary(ffprobe)
+
+        if (
+            ffmpeg_test.get("executable")
+            and
+            ffprobe_test.get("executable")
+        ):
+
+            return ffmpeg, ffprobe
+
+    # --------------------------------------------------------
+    # Another invocation may already be installing it
+    # --------------------------------------------------------
+
+    if (
+        FFMPEG_INSTALL_LOCK.exists()
+        and
+        FFMPEG_DIR.exists()
+    ):
+
+        for _ in range(60):
+
+            ffmpeg = find_binary("ffmpeg")
+            ffprobe = find_binary("ffprobe")
+
+            if ffmpeg and ffprobe:
+
+                if (
+                    test_binary(ffmpeg).get("executable")
+                    and
+                    test_binary(ffprobe).get("executable")
+                ):
+
+                    return ffmpeg, ffprobe
+
+            time.sleep(1)
+
+    # --------------------------------------------------------
+    # Create installation lock
+    # --------------------------------------------------------
+
+    try:
+
+        FFMPEG_INSTALL_LOCK.touch(
+            exist_ok=True
+        )
+
+    except Exception:
+        pass
+
+    try:
+
+        # Check again after obtaining lock
+        ffmpeg = find_binary("ffmpeg")
+        ffprobe = find_binary("ffprobe")
+
+        if ffmpeg and ffprobe:
+
+            if (
+                test_binary(ffmpeg).get("executable")
+                and
+                test_binary(ffprobe).get("executable")
+            ):
+
+                return ffmpeg, ffprobe
+
+        # ----------------------------------------------------
+        # Clean old incomplete installation
+        # ----------------------------------------------------
+
+        if FFMPEG_DIR.exists():
+
+            shutil.rmtree(
+                FFMPEG_DIR,
+                ignore_errors=True
+            )
+
+        FFMPEG_DIR.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        # ----------------------------------------------------
+        # Download archive
+        # ----------------------------------------------------
+
+        print("Downloading FFmpeg...")
+
+        with requests.get(
+            FFMPEG_URL,
+            stream=True,
+            timeout=(30, 300)
+        ) as response:
+
+            response.raise_for_status()
+
+            with open(
+                FFMPEG_ARCHIVE,
+                "wb"
+            ) as output:
+
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+
+                    if chunk:
+
+                        output.write(chunk)
+
+        # ----------------------------------------------------
+        # Extract archive
+        # ----------------------------------------------------
+
+        print("Extracting FFmpeg...")
+
+        with tarfile.open(
+            FFMPEG_ARCHIVE,
+            "r:xz"
+        ) as archive:
+
+            archive.extractall(
+                FFMPEG_DIR
+            )
+
+        # ----------------------------------------------------
+        # Locate extracted binaries
+        # ----------------------------------------------------
+
+        ffmpeg = None
+        ffprobe = None
+
+        for path in FFMPEG_DIR.rglob("ffmpeg"):
+
+            if path.is_file():
+
+                ffmpeg = path
+                break
+
+        for path in FFMPEG_DIR.rglob("ffprobe"):
+
+            if path.is_file():
+
+                ffprobe = path
+                break
+
+        if not ffmpeg:
+
+            raise RuntimeError(
+                "FFmpeg was downloaded but "
+                "the ffmpeg binary was not found."
+            )
+
+        if not ffprobe:
+
+            raise RuntimeError(
+                "FFmpeg was downloaded but "
+                "the ffprobe binary was not found."
+            )
+
+        # ----------------------------------------------------
+        # Make executable
+        # ----------------------------------------------------
+
+        ffmpeg.chmod(
+            ffmpeg.stat().st_mode | 0o111
+        )
+
+        ffprobe.chmod(
+            ffprobe.stat().st_mode | 0o111
+        )
+
+        # ----------------------------------------------------
+        # Test binaries
+        # ----------------------------------------------------
+
+        ffmpeg_test = test_binary(
+            str(ffmpeg)
+        )
+
+        ffprobe_test = test_binary(
+            str(ffprobe)
+        )
+
+        if not ffmpeg_test.get("executable"):
+
+            raise RuntimeError(
+                "Downloaded FFmpeg cannot execute: "
+                + str(ffmpeg_test)
+            )
+
+        if not ffprobe_test.get("executable"):
+
+            raise RuntimeError(
+                "Downloaded FFprobe cannot execute: "
+                + str(ffprobe_test)
+            )
+
+        # ----------------------------------------------------
+        # Remove archive to save /tmp space
+        # ----------------------------------------------------
+
+        try:
+
+            FFMPEG_ARCHIVE.unlink(
+                missing_ok=True
+            )
+
+        except Exception:
+            pass
+
+        print(
+            "FFmpeg installed successfully."
+        )
+
+        return (
+            str(ffmpeg),
+            str(ffprobe)
+        )
+
+    finally:
+
+        try:
+
+            FFMPEG_INSTALL_LOCK.unlink(
+                missing_ok=True
+            )
+
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -269,27 +514,18 @@ def detect_ffmpeg():
         "ffmpeg"
     )
 
-    if not path:
+    if path:
 
-        raise RuntimeError(
-            "FFmpeg was not found. "
-            "Make sure bin/ffmpeg exists."
-        )
+        result = test_binary(path)
 
-    result = test_binary(path)
+        if result.get("executable"):
 
-    if not result.get(
-        "executable",
-        False
-    ):
+            return path
 
-        raise RuntimeError(
-            "FFmpeg was found but cannot "
-            "be executed: "
-            + str(result)
-        )
+    # Automatically install
+    ffmpeg, ffprobe = download_ffmpeg()
 
-    return path
+    return ffmpeg
 
 
 # ============================================================
@@ -302,27 +538,18 @@ def detect_ffprobe():
         "ffprobe"
     )
 
-    if not path:
+    if path:
 
-        raise RuntimeError(
-            "ffprobe was not found. "
-            "Make sure bin/ffprobe exists."
-        )
+        result = test_binary(path)
 
-    result = test_binary(path)
+        if result.get("executable"):
 
-    if not result.get(
-        "executable",
-        False
-    ):
+            return path
 
-        raise RuntimeError(
-            "ffprobe was found but cannot "
-            "be executed: "
-            + str(result)
-        )
+    # Automatically install both
+    ffmpeg, ffprobe = download_ffmpeg()
 
-    return path
+    return ffprobe
 
 
 # ============================================================
@@ -342,18 +569,13 @@ def detect_ffmpeg_directory():
         ffprobe
     )
 
-    # Both binaries should normally be
-    # inside the same directory.
+    if ffmpeg_path.parent == ffprobe_path.parent:
 
-    if ffmpeg_path.parent != ffprobe_path.parent:
+        return str(
+            ffmpeg_path.parent
+        )
 
-        # yt-dlp can still accept the ffmpeg
-        # binary path directly.
-        return ffmpeg
-
-    return str(
-        ffmpeg_path.parent
-    )
+    return ffmpeg
 
 
 # ============================================================
@@ -449,7 +671,6 @@ def extract_video_id(url):
             parsed.hostname or ""
         ).lower()
 
-        # youtu.be
         if hostname in (
             "youtu.be",
             "www.youtu.be"
@@ -462,10 +683,8 @@ def extract_video_id(url):
 
             return video_id or None
 
-        # youtube.com
         if "youtube.com" in hostname:
 
-            # ?v=
             match = re.search(
                 r"(?:^|&)v=([^&]+)",
                 parsed.query
@@ -475,7 +694,6 @@ def extract_video_id(url):
 
                 return match.group(1)
 
-            # /shorts/ID
             match = re.search(
                 r"/shorts/([^/?]+)",
                 parsed.path
@@ -485,7 +703,6 @@ def extract_video_id(url):
 
                 return match.group(1)
 
-            # /embed/ID
             match = re.search(
                 r"/embed/([^/?]+)",
                 parsed.path
@@ -517,11 +734,8 @@ def safe_filename(filename):
     )
 
     filename = re.sub(
-
         r'[<>:"/\\|?*\x00-\x1F]',
-
         "_",
-
         filename
     )
 
@@ -542,9 +756,6 @@ def safe_filename(filename):
 # ============================================================
 
 def authorized_request():
-
-    # If API_TOKEN is empty,
-    # authentication is disabled.
 
     if not API_TOKEN:
 
@@ -656,53 +867,79 @@ def health():
 )
 def healthz():
 
-    ffmpeg = find_binary(
-        "ffmpeg"
-    )
+    try:
 
-    ffprobe = find_binary(
-        "ffprobe"
-    )
+        # This automatically installs FFmpeg
+        # if it doesn't already exist.
+        ffmpeg = detect_ffmpeg()
 
-    ffmpeg_test = test_binary(
-        ffmpeg
-    )
+        ffprobe = detect_ffprobe()
 
-    ffprobe_test = test_binary(
-        ffprobe
-    )
+        ffmpeg_test = test_binary(
+            ffmpeg
+        )
 
-    return jsonify({
+        ffprobe_test = test_binary(
+            ffprobe
+        )
 
-        "status":
-            "ok",
+        return jsonify({
 
-        "ffmpeg":
-            {
+            "status":
+                "ok",
+
+            "ffmpeg": {
+
                 "found":
-                    bool(ffmpeg),
+                    True,
 
                 "path":
                     ffmpeg,
 
                 **ffmpeg_test
+
             },
 
-        "ffprobe":
-            {
+            "ffprobe": {
+
                 "found":
-                    bool(ffprobe),
+                    True,
 
                 "path":
                     ffprobe,
 
                 **ffprobe_test
+
             },
 
-        "download_directory":
-            str(DOWNLOAD_DIR)
+            "download_directory":
+                str(DOWNLOAD_DIR),
 
-    })
+            "ffmpeg_directory":
+                str(FFMPEG_DIR)
+
+        })
+
+    except Exception as e:
+
+        return jsonify({
+
+            "status":
+                "error",
+
+            "error":
+                "FFmpeg initialization failed",
+
+            "details":
+                str(e),
+
+            "ffmpeg":
+                find_binary("ffmpeg"),
+
+            "ffprobe":
+                find_binary("ffprobe")
+
+        }), 500
 
 
 # ============================================================
@@ -910,10 +1147,6 @@ def search():
 )
 def download():
 
-    # --------------------------------------------------------
-    # AUTH
-    # --------------------------------------------------------
-
     if not authorized_request():
 
         return jsonify({
@@ -923,14 +1156,10 @@ def download():
 
         }), 401
 
-    # --------------------------------------------------------
-    # CLEAN OLD FILES
-    # --------------------------------------------------------
-
     cleanup_old_files()
 
     # --------------------------------------------------------
-    # GET PARAMETERS
+    # PARAMETERS
     # --------------------------------------------------------
 
     if request.method == "POST":
@@ -966,7 +1195,7 @@ def download():
         ).lower().strip()
 
     # --------------------------------------------------------
-    # URL VALIDATION
+    # URL
     # --------------------------------------------------------
 
     if not url:
@@ -988,7 +1217,7 @@ def download():
         }), 400
 
     # --------------------------------------------------------
-    # TYPE VALIDATION
+    # TYPE
     # --------------------------------------------------------
 
     if download_type not in (
@@ -1004,7 +1233,7 @@ def download():
         }), 400
 
     # --------------------------------------------------------
-    # FFMPEG DETECTION
+    # FFMPEG
     # --------------------------------------------------------
 
     try:
@@ -1166,7 +1395,7 @@ def download():
     # AUDIO
     # --------------------------------------------------------
 
-    elif download_type == "audio":
+    else:
 
         ydl_opts.update({
 
@@ -1236,14 +1465,10 @@ def download():
                 "no output file was found."
             )
 
-        # Newest file
         output_file = max(
-
             files,
-
             key=lambda p:
                 p.stat().st_mtime
-
         )
 
         # ----------------------------------------------------
@@ -1255,7 +1480,7 @@ def download():
         )
 
         # ----------------------------------------------------
-        # MIME TYPE
+        # MIME
         # ----------------------------------------------------
 
         if download_type == "audio":
@@ -1267,7 +1492,7 @@ def download():
             mimetype = "video/mp4"
 
         # ----------------------------------------------------
-        # SEND FILE
+        # SEND
         # ----------------------------------------------------
 
         return send_file(
@@ -1281,10 +1506,6 @@ def download():
             mimetype=mimetype
 
         )
-
-    # --------------------------------------------------------
-    # YT-DLP ERROR
-    # --------------------------------------------------------
 
     except yt_dlp.DownloadError as e:
 
@@ -1309,10 +1530,6 @@ def download():
 
         }), 500
 
-    # --------------------------------------------------------
-    # GENERAL ERROR
-    # --------------------------------------------------------
-
     except Exception as e:
 
         shutil.rmtree(
@@ -1336,18 +1553,10 @@ def download():
 
         }), 500
 
-    finally:
-
-        # We intentionally don't delete the successful
-        # output immediately because send_file needs it.
-
-        pass
-
 
 # ============================================================
 # VERCEL
 # ============================================================
 
-# DO NOT use app.run() here.
-#
+# Do NOT use app.run().
 # Vercel automatically loads the Flask "app" object.
